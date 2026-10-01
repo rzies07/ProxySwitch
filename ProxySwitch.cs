@@ -4,8 +4,10 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Windows.Forms;
 using System.Net;
+using System.Net.Sockets;
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 using System.Collections.Generic;
@@ -13,7 +15,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Text.RegularExpressions;
 
-namespace ProxyDominator
+namespace ProxySwitch
 {
     public class TimeoutWebClient : WebClient
     {
@@ -31,12 +33,16 @@ namespace ProxyDominator
     {
         public string Tag;
         public string Endpoint;
+        public string Username;
+        public string Password;
         public long PingMs;
 
-        public ProxyItem(string tag, string endpoint)
+        public ProxyItem(string tag, string endpoint, string username = "", string password = "")
         {
             Tag = Sanitize(tag);
             Endpoint = Sanitize(endpoint);
+            Username = Sanitize(username);
+            Password = Sanitize(password);
             PingMs = -1;
         }
 
@@ -46,16 +52,21 @@ namespace ProxyDominator
             return input.Replace(";", "_").Replace("|", "_").Trim();
         }
 
+        public bool HasAuth
+        {
+            get { return !string.IsNullOrEmpty(Username); }
+        }
+
         public override string ToString()
         {
-            if (string.IsNullOrEmpty(Tag)) return Endpoint;
-            return Tag + " [" + Endpoint + "]";
+            string authLabel = HasAuth ? " [AUTH]" : "";
+            if (string.IsNullOrEmpty(Tag)) return Endpoint + authLabel;
+            return Tag + " [" + Endpoint + "]" + authLabel;
         }
 
         public string ToRawString()
         {
-            if (string.IsNullOrEmpty(Tag)) return Endpoint;
-            return Tag + ";" + Endpoint;
+            return string.Format("{0};{1};{2};{3}", Tag, Endpoint, Username, Password);
         }
 
         public static ProxyItem FromRawString(string raw)
@@ -64,35 +75,177 @@ namespace ProxyDominator
             if (raw.Contains(";"))
             {
                 string[] parts = raw.Split(';');
-                if (parts.Length >= 2) return new ProxyItem(parts[0], parts[1]);
+                if (parts.Length >= 4)
+                    return new ProxyItem(parts[0], parts[1], parts[2], parts[3]);
+                if (parts.Length >= 2)
+                    return new ProxyItem(parts[0], parts[1]);
             }
             return new ProxyItem("", raw);
+        }
+    }
+
+    public class LocalAuthBridge
+    {
+        private TcpListener listener;
+        private CancellationTokenSource cts;
+        public int LocalPort { get; private set; }
+        public string RemoteHost { get; private set; }
+        public int RemotePort { get; private set; }
+        public string Username { get; private set; }
+        public string Password { get; private set; }
+        public bool IsRunning { get; private set; }
+
+        public void Start(string remoteEndpoint, string username, string password)
+        {
+            Stop();
+
+            string[] parts = remoteEndpoint.Split(':');
+            RemoteHost = parts[0];
+            RemotePort = int.Parse(parts[1]);
+            Username = username;
+            Password = password;
+
+            listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            LocalPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+            cts = new CancellationTokenSource();
+            IsRunning = true;
+
+            Task.Run(async () =>
+            {
+                while (!cts.Token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        TcpClient client = await listener.AcceptTcpClientAsync();
+                        Task bgTask = ProcessClientAsync(client, cts.Token);
+                    }
+                    catch
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+
+        public void Stop()
+        {
+            IsRunning = false;
+            try { if (cts != null) cts.Cancel(); } catch { }
+            try { if (listener != null) listener.Stop(); } catch { }
+        }
+
+        private async Task ProcessClientAsync(TcpClient client, CancellationToken token)
+        {
+            TcpClient server = new TcpClient();
+            try
+            {
+                await server.ConnectAsync(RemoteHost, RemotePort);
+
+                NetworkStream clientStream = client.GetStream();
+                NetworkStream serverStream = server.GetStream();
+
+                byte[] buffer = new byte[8192];
+                int read = await clientStream.ReadAsync(buffer, 0, buffer.Length, token);
+                if (read <= 0) { client.Close(); server.Close(); return; }
+
+                string initialRequest = Encoding.ASCII.GetString(buffer, 0, read);
+                string authHeader = "";
+                if (!string.IsNullOrEmpty(Username))
+                {
+                    string credentials = Convert.ToBase64String(Encoding.ASCII.GetBytes(Username + ":" + Password));
+                    authHeader = "Proxy-Authorization: Basic " + credentials + "\r\n";
+                }
+
+                if (initialRequest.StartsWith("CONNECT ", StringComparison.OrdinalIgnoreCase))
+                {
+                    int firstLineEnd = initialRequest.IndexOf("\r\n");
+                    if (firstLineEnd > 0)
+                    {
+                        string firstLine = initialRequest.Substring(0, firstLineEnd + 2);
+                        string remainder = initialRequest.Substring(firstLineEnd + 2);
+                        string modified = firstLine + authHeader + remainder;
+                        byte[] modBytes = Encoding.ASCII.GetBytes(modified);
+                        await serverStream.WriteAsync(modBytes, 0, modBytes.Length, token);
+
+                        byte[] srvResp = new byte[4096];
+                        int srvRead = await serverStream.ReadAsync(srvResp, 0, srvResp.Length, token);
+                        string srvRespStr = Encoding.ASCII.GetString(srvResp, 0, srvRead);
+
+                        if (srvRespStr.Contains("200 Connection established") || srvRespStr.Contains("200 OK"))
+                        {
+                            byte[] ok200 = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection established\r\n\r\n");
+                            await clientStream.WriteAsync(ok200, 0, ok200.Length, token);
+                        }
+                        else
+                        {
+                            await clientStream.WriteAsync(srvResp, 0, srvRead, token);
+                            client.Close();
+                            server.Close();
+                            return;
+                        }
+                    }
+                }
+                else
+                {
+                    int firstLineEnd = initialRequest.IndexOf("\r\n");
+                    if (firstLineEnd > 0)
+                    {
+                        string firstLine = initialRequest.Substring(0, firstLineEnd + 2);
+                        string remainder = initialRequest.Substring(firstLineEnd + 2);
+                        string modified = firstLine + authHeader + remainder;
+                        byte[] modBytes = Encoding.ASCII.GetBytes(modified);
+                        await serverStream.WriteAsync(modBytes, 0, modBytes.Length, token);
+                    }
+                    else
+                    {
+                        await serverStream.WriteAsync(buffer, 0, read, token);
+                    }
+                }
+
+                Task t1 = RelayStreamAsync(clientStream, serverStream, token);
+                Task t2 = RelayStreamAsync(serverStream, clientStream, token);
+                await Task.WhenAny(t1, t2);
+            }
+            catch { }
+            finally
+            {
+                try { client.Close(); } catch { }
+                try { server.Close(); } catch { }
+            }
+        }
+
+        private async Task RelayStreamAsync(NetworkStream from, NetworkStream to, CancellationToken token)
+        {
+            byte[] buf = new byte[16384];
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    int r = await from.ReadAsync(buf, 0, buf.Length, token);
+                    if (r <= 0) break;
+                    await to.WriteAsync(buf, 0, r, token);
+                }
+            }
+            catch { }
         }
     }
 
     public class SolidCard : Panel
     {
         public Color BorderColor { get; set; }
-
         public SolidCard()
         {
             this.SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
             this.BackColor = Color.FromArgb(16, 16, 18);
             BorderColor = Color.FromArgb(34, 34, 38);
         }
-
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
             Graphics g = e.Graphics;
-            using (SolidBrush bgBrush = new SolidBrush(this.BackColor))
-            {
-                g.FillRectangle(bgBrush, this.ClientRectangle);
-            }
-            using (Pen borderPen = new Pen(BorderColor, 1f))
-            {
-                g.DrawRectangle(borderPen, 0, 0, this.Width - 1, this.Height - 1);
-            }
+            using (SolidBrush bgBrush = new SolidBrush(this.BackColor)) { g.FillRectangle(bgBrush, this.ClientRectangle); }
+            using (Pen borderPen = new Pen(BorderColor, 1f)) { g.DrawRectangle(borderPen, 0, 0, this.Width - 1, this.Height - 1); }
         }
     }
 
@@ -119,7 +272,6 @@ namespace ProxyDominator
         {
             Graphics g = pevent.Graphics;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-
             Rectangle rect = new Rectangle(0, 0, this.Width, this.Height);
 
             if (IsPrimary)
@@ -132,10 +284,8 @@ namespace ProxyDominator
             {
                 Color bg = isPressed ? Color.FromArgb(28, 28, 32) : (isHovered ? Color.FromArgb(24, 24, 28) : Color.FromArgb(16, 16, 18));
                 using (SolidBrush b = new SolidBrush(bg)) g.FillRectangle(b, rect);
-
                 Color border = isHovered ? Color.FromArgb(80, 80, 88) : Color.FromArgb(36, 36, 42);
                 using (Pen p = new Pen(border, 1f)) g.DrawRectangle(p, 0, 0, this.Width - 1, this.Height - 1);
-
                 Color txt = isHovered ? Color.White : Color.FromArgb(190, 190, 196);
                 TextRenderer.DrawText(g, this.Text, this.Font, rect, txt, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             }
@@ -144,17 +294,11 @@ namespace ProxyDominator
 
     public class MainForm : Form
     {
-        [DllImport("user32.dll")]
-        public static extern int SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
-        [DllImport("user32.dll")]
-        public static extern bool ReleaseCapture();
-        [DllImport("wininet.dll")]
-        public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
-
-        [DllImport("user32.dll")]
-        public static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
-        [DllImport("user32.dll")]
-        public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll")] public static extern int SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
+        [DllImport("user32.dll")] public static extern bool ReleaseCapture();
+        [DllImport("wininet.dll")] public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
+        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
         private const int HOTKEY_ID = 9000;
         private const int MOD_CONTROL = 0x0002;
@@ -163,15 +307,15 @@ namespace ProxyDominator
 
         private const string REG_PATH = @"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
         private const string REG_AUTORUN = @"Software\Microsoft\Windows\CurrentVersion\Run";
-        private const string APP_NAME = "ProxyDominator";
+        private const string APP_NAME = "ProxySwitch";
 
         private static readonly Regex BypassValidationRegex = new Regex(@"^[a-zA-Z0-9\.\*\<\>\:\-_;\s]+$");
         private static readonly Regex EndpointValidationRegex = new Regex(@"^[a-zA-Z0-9\.\-_]+:[0-9]{1,5}$");
 
         private string cfgPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "proxy_dominator_cfg.txt");
-
         private List<ProxyItem> proxies = new List<ProxyItem>();
         private string currentCountry = "";
+        private LocalAuthBridge authBridge = new LocalAuthBridge();
 
         Panel titleBar;
         Label titleLbl;
@@ -184,6 +328,8 @@ namespace ProxyDominator
         ComboBox proxyCombo;
         TextBox tagTxt;
         TextBox endpointTxt;
+        TextBox userTxt;
+        TextBox passTxt;
         SolidButton addBtn;
         SolidButton delBtn;
         SolidButton toggleBtn;
@@ -202,16 +348,13 @@ namespace ProxyDominator
         CheckBox failoverChk;
 
         RichTextBox resultsBox;
-
         NotifyIcon trayIcon;
         ContextMenu trayMenu;
-
         private System.Windows.Forms.Timer failoverTimer;
 
-        class PingTarget {
-            public string Name;
-            public string Url;
-            public bool Geo;
+        class PingTarget
+        {
+            public string Name; public string Url; public bool Geo;
             public PingTarget(string n, string u, bool g) { Name = n; Url = u; Geo = g; }
         }
 
@@ -219,18 +362,17 @@ namespace ProxyDominator
         {
             this.FormBorderStyle = FormBorderStyle.None;
             this.StartPosition = FormStartPosition.CenterScreen;
-            this.Size = new Size(520, 830);
+            this.Size = new Size(520, 870);
             this.BackColor = Color.FromArgb(10, 10, 11);
             this.ForeColor = Color.White;
-            this.Text = "PROXY DOMINATOR";
+            this.Text = "PROXY SWITCH";
 
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-
             try {
                 if (File.Exists("app.ico")) this.Icon = new Icon("app.ico");
                 else if (Icon.ExtractAssociatedIcon(Application.ExecutablePath) != null)
                     this.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
-            } catch {}
+            } catch { }
 
             InitTray();
             InitUI();
@@ -238,15 +380,12 @@ namespace ProxyDominator
             LoadBypass();
 
             RegisterHotKey(this.Handle, HOTKEY_ID, MOD_CONTROL | MOD_SHIFT, VK_P);
-
             CheckState();
-            Task dummyTask = FetchGeoAsync();
+            Task dummy = FetchGeoAsync();
 
             failoverTimer = new System.Windows.Forms.Timer();
             failoverTimer.Interval = 60000;
-            failoverTimer.Tick += async (s, e) => {
-                if (failoverChk.Checked) await RunHealthCheckAsync();
-            };
+            failoverTimer.Tick += async (s, e) => { if (failoverChk.Checked) await RunHealthCheckAsync(); };
             failoverTimer.Start();
         }
 
@@ -269,12 +408,9 @@ namespace ProxyDominator
                 return;
             }
 
+            authBridge.Stop();
             UnregisterHotKey(this.Handle, HOTKEY_ID);
-            if (trayIcon != null)
-            {
-                trayIcon.Visible = false;
-                trayIcon.Dispose();
-            }
+            if (trayIcon != null) { trayIcon.Visible = false; trayIcon.Dispose(); }
             base.OnFormClosing(e);
         }
 
@@ -283,7 +419,7 @@ namespace ProxyDominator
             this.Hide();
             if (trayIcon != null)
             {
-                trayIcon.ShowBalloonTip(1000, "Proxy Dominator", "Приложение свернуто в трей. Чтобы выйти полностью — ПКМ по иконке в трее -> Exit.", ToolTipIcon.Info);
+                trayIcon.ShowBalloonTip(1000, "Proxy Dominator", "Свернуто в трей. Выход через меню трея.", ToolTipIcon.Info);
             }
         }
 
@@ -294,6 +430,7 @@ namespace ProxyDominator
             trayMenu.MenuItems.Add("Открыть окно", (s, e) => ShowFromTray());
             trayMenu.MenuItems.Add("-");
             trayMenu.MenuItems.Add("Выход (Exit)", (s, e) => {
+                authBridge.Stop();
                 UnregisterHotKey(this.Handle, HOTKEY_ID);
                 if (trayIcon != null) { trayIcon.Visible = false; trayIcon.Dispose(); }
                 Application.Exit();
@@ -301,7 +438,7 @@ namespace ProxyDominator
 
             trayIcon = new NotifyIcon();
             trayIcon.Text = "Proxy Dominator";
-            try { if (this.Icon != null) trayIcon.Icon = this.Icon; } catch {}
+            try { if (this.Icon != null) trayIcon.Icon = this.Icon; } catch { }
             trayIcon.ContextMenu = trayMenu;
             trayIcon.Visible = true;
             trayIcon.DoubleClick += (s, e) => ShowFromTray();
@@ -320,7 +457,7 @@ namespace ProxyDominator
             titleBar = new Panel { Bounds = new Rectangle(0, 0, 520, 42), BackColor = Color.FromArgb(14, 14, 16) };
             titleBar.MouseDown += (s, e) => { ReleaseCapture(); SendMessage(Handle, 0xA1, 0x2, 0); };
 
-            titleLbl = new Label { Text = "PROXY DOMINATOR", Font = new Font("Segoe UI", 10.5f, FontStyle.Bold), ForeColor = Color.FromArgb(180, 180, 185), AutoSize = true, Location = new Point(16, 12) };
+            titleLbl = new Label { Text = "PROXY SWITCH", Font = new Font("Segoe UI", 10.5f, FontStyle.Bold), ForeColor = Color.FromArgb(180, 180, 185), AutoSize = true, Location = new Point(16, 12) };
             titleLbl.MouseDown += (s, e) => { ReleaseCapture(); SendMessage(Handle, 0xA1, 0x2, 0); };
 
             closeBtn = new Label { Text = "✕", Font = new Font("Segoe UI", 12, FontStyle.Bold), ForeColor = Color.FromArgb(130, 130, 135), AutoSize = true, Location = new Point(488, 10), Cursor = Cursors.Hand };
@@ -333,15 +470,15 @@ namespace ProxyDominator
             this.Controls.Add(titleBar);
 
             // Status Card
-            statusCard = new SolidCard { Bounds = new Rectangle(16, 56, 488, 80) };
+            statusCard = new SolidCard { Bounds = new Rectangle(16, 54, 488, 80) };
             statusLbl = new Label { Bounds = new Rectangle(10, 10, 468, 32), Text = "STATUS: CHECKING...", Font = new Font("Segoe UI", 18, FontStyle.Bold), TextAlign = ContentAlignment.MiddleCenter, BackColor = Color.Transparent, ForeColor = Color.White };
             ipLbl = new Label { Bounds = new Rectangle(10, 44, 468, 24), Text = "IP: -", Font = new Font("Segoe UI", 11.5f, FontStyle.Regular), ForeColor = Color.FromArgb(210, 210, 215), TextAlign = ContentAlignment.MiddleCenter, BackColor = Color.Transparent };
             statusCard.Controls.Add(statusLbl);
             statusCard.Controls.Add(ipLbl);
             this.Controls.Add(statusCard);
 
-            // Proxy Manager Card
-            SolidCard pmCard = new SolidCard { Bounds = new Rectangle(16, 148, 488, 122) };
+            // Proxy Manager Card with Auth fields
+            SolidCard pmCard = new SolidCard { Bounds = new Rectangle(16, 144, 488, 154) };
             Label pmLbl = new Label { Bounds = new Rectangle(12, 6, 460, 16), Text = "СЕРВЕРЫ (МЕНЕДЖЕР ПРОКСИ)", Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), ForeColor = Color.FromArgb(130, 130, 138) };
 
             proxyCombo = new ComboBox { Bounds = new Rectangle(12, 26, 342, 25), Font = new Font("Segoe UI", 10f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat };
@@ -357,33 +494,48 @@ namespace ProxyDominator
             SolidButton sortBtn = new SolidButton { Text = "SORT", Size = new Size(54, 26), Location = new Point(422, 25) };
             sortBtn.Click += async (s, e) => await SortProxiesByPingAsync();
 
-            tagTxt = new TextBox { Bounds = new Rectangle(12, 58, 100, 24), Font = new Font("Segoe UI", 10f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Text = "Tag" };
+            tagTxt = new TextBox { Bounds = new Rectangle(12, 58, 120, 24), Font = new Font("Segoe UI", 9.5f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Text = "Tag" };
             tagTxt.GotFocus += (s, e) => { if (tagTxt.Text == "Tag") tagTxt.Text = ""; };
             tagTxt.LostFocus += (s, e) => { if (string.IsNullOrWhiteSpace(tagTxt.Text)) tagTxt.Text = "Tag"; };
 
-            endpointTxt = new TextBox { Bounds = new Rectangle(118, 58, 252, 24), Font = new Font("Segoe UI", 10f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Text = "IP:PORT" };
+            endpointTxt = new TextBox { Bounds = new Rectangle(140, 58, 232, 24), Font = new Font("Segoe UI", 9.5f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Text = "IP:PORT" };
             endpointTxt.GotFocus += (s, e) => { if (endpointTxt.Text == "IP:PORT") endpointTxt.Text = ""; };
             endpointTxt.LostFocus += (s, e) => { if (string.IsNullOrWhiteSpace(endpointTxt.Text)) endpointTxt.Text = "IP:PORT"; };
 
-            addBtn = new SolidButton { Text = "ADD PROXY", Size = new Size(100, 26), Location = new Point(376, 57) };
+            addBtn = new SolidButton { Text = "ADD PROXY", Size = new Size(100, 56), Location = new Point(376, 58) };
             addBtn.Click += (s, e) => {
                 string ep = endpointTxt.Text.Trim();
                 string tg = tagTxt.Text.Trim();
+                string usr = userTxt.Text.Trim();
+                string pwd = passTxt.Text.Trim();
+
                 if (tg == "Tag") tg = "";
                 if (ep == "IP:PORT") ep = "";
+                if (usr == "Username") usr = "";
+                if (pwd == "Password") pwd = "";
 
                 if (string.IsNullOrEmpty(ep) || !EndpointValidationRegex.IsMatch(ep)) {
                     MessageBox.Show("Формат должен быть строго IP:PORT (например 127.0.0.1:8080)", "Валидация", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
-                proxies.Add(new ProxyItem(tg, ep));
+                proxies.Add(new ProxyItem(tg, ep, usr, pwd));
                 SaveConfig();
                 UpdateCombo();
                 endpointTxt.Text = "";
+                userTxt.Text = "Username";
+                passTxt.Text = "Password";
             };
 
-            Label hotkeyNotice = new Label { Bounds = new Rectangle(12, 92, 460, 18), Text = "Горячая клавиша: Ctrl+Shift+P | Крестик сворачивает в трей", Font = new Font("Segoe UI", 8.5f), ForeColor = Color.FromArgb(100, 100, 108) };
+            userTxt = new TextBox { Bounds = new Rectangle(12, 90, 175, 24), Font = new Font("Segoe UI", 9.5f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Text = "Username" };
+            userTxt.GotFocus += (s, e) => { if (userTxt.Text == "Username") userTxt.Text = ""; };
+            userTxt.LostFocus += (s, e) => { if (string.IsNullOrWhiteSpace(userTxt.Text)) userTxt.Text = "Username"; };
+
+            passTxt = new TextBox { Bounds = new Rectangle(197, 90, 175, 24), Font = new Font("Segoe UI", 9.5f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Text = "Password" };
+            passTxt.GotFocus += (s, e) => { if (passTxt.Text == "Password") passTxt.Text = ""; };
+            passTxt.LostFocus += (s, e) => { if (string.IsNullOrWhiteSpace(passTxt.Text)) passTxt.Text = "Password"; };
+
+            Label hotkeyNotice = new Label { Bounds = new Rectangle(12, 126, 460, 18), Text = "Поддерживается логин/пароль через локальный TCP мост", Font = new Font("Segoe UI", 8.5f), ForeColor = Color.FromArgb(100, 100, 108) };
 
             pmCard.Controls.Add(pmLbl);
             pmCard.Controls.Add(proxyCombo);
@@ -391,21 +543,23 @@ namespace ProxyDominator
             pmCard.Controls.Add(sortBtn);
             pmCard.Controls.Add(tagTxt);
             pmCard.Controls.Add(endpointTxt);
+            pmCard.Controls.Add(userTxt);
+            pmCard.Controls.Add(passTxt);
             pmCard.Controls.Add(addBtn);
             pmCard.Controls.Add(hotkeyNotice);
             this.Controls.Add(pmCard);
 
             // Action Buttons
-            toggleBtn = new SolidButton { Text = "SWITCH PROXY", Bounds = new Rectangle(16, 282, 488, 44), Font = new Font("Segoe UI", 12f, FontStyle.Bold), IsPrimary = true };
+            toggleBtn = new SolidButton { Text = "SWITCH PROXY", Bounds = new Rectangle(16, 308, 488, 44), Font = new Font("Segoe UI", 12f, FontStyle.Bold), IsPrimary = true };
             toggleBtn.Click += ToggleProxy;
 
-            refreshBtn = new SolidButton { Text = "REFRESH ROUTE", Bounds = new Rectangle(16, 334, 156, 34) };
+            refreshBtn = new SolidButton { Text = "REFRESH ROUTE", Bounds = new Rectangle(16, 360, 156, 34) };
             refreshBtn.Click += async (s, e) => await FetchGeoAsync();
 
-            pingBtn = new SolidButton { Text = "PING SERVICES", Bounds = new Rectangle(182, 334, 156, 34) };
+            pingBtn = new SolidButton { Text = "PING SERVICES", Bounds = new Rectangle(182, 360, 156, 34) };
             pingBtn.Click += async (s, e) => await PingServicesAsync();
 
-            speedBtn = new SolidButton { Text = "SPEED TEST", Bounds = new Rectangle(348, 334, 156, 34) };
+            speedBtn = new SolidButton { Text = "SPEED TEST", Bounds = new Rectangle(348, 360, 156, 34) };
             speedBtn.Click += async (s, e) => await RunSpeedTestAsync();
 
             this.Controls.Add(toggleBtn);
@@ -414,7 +568,7 @@ namespace ProxyDominator
             this.Controls.Add(speedBtn);
 
             // Bypass Card
-            SolidCard bpCard = new SolidCard { Bounds = new Rectangle(16, 380, 488, 66) };
+            SolidCard bpCard = new SolidCard { Bounds = new Rectangle(16, 406, 488, 66) };
             Label bpLbl = new Label { Bounds = new Rectangle(12, 6, 460, 16), Text = "ИСКЛЮЧЕНИЯ (PROXY OVERRIDE)", Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), ForeColor = Color.FromArgb(130, 130, 138) };
             bypassTxt = new TextBox { Bounds = new Rectangle(12, 26, 380, 24), Font = new Font("Segoe UI", 9.5f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle };
             saveBypassBtn = new SolidButton { Text = "SAVE", Size = new Size(78, 26), Location = new Point(398, 25) };
@@ -424,8 +578,8 @@ namespace ProxyDominator
             bpCard.Controls.Add(saveBypassBtn);
             this.Controls.Add(bpCard);
 
-            // Custom Ping Card (Без категорий)
-            SolidCard cpCard = new SolidCard { Bounds = new Rectangle(16, 458, 488, 68) };
+            // Custom Ping Card
+            SolidCard cpCard = new SolidCard { Bounds = new Rectangle(16, 482, 488, 68) };
             Label cpLbl = new Label { Bounds = new Rectangle(12, 6, 460, 16), Text = "ПРОВЕРКА URL", Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), ForeColor = Color.FromArgb(130, 130, 138) };
             customPingTxt = new TextBox { Bounds = new Rectangle(12, 26, 290, 24), Font = new Font("Segoe UI", 9.5f), BackColor = Color.FromArgb(22, 22, 26), ForeColor = Color.White, BorderStyle = BorderStyle.FixedSingle, Text = "example.com" };
             customPingBtn = new SolidButton { Text = "TEST", Size = new Size(70, 26), Location = new Point(308, 25) };
@@ -449,7 +603,7 @@ namespace ProxyDominator
             this.Controls.Add(cpCard);
 
             // Settings Bar
-            SolidCard setCard = new SolidCard { Bounds = new Rectangle(16, 538, 488, 44) };
+            SolidCard setCard = new SolidCard { Bounds = new Rectangle(16, 560, 488, 44) };
             autoRunChk = new CheckBox { Text = "Автозапуск Windows", Bounds = new Rectangle(16, 10, 160, 24), ForeColor = Color.FromArgb(170, 170, 178), Font = new Font("Segoe UI", 8.5f) };
             autoRunChk.CheckedChanged += (s, e) => ToggleAutoRun(autoRunChk.Checked);
 
@@ -461,7 +615,7 @@ namespace ProxyDominator
 
             // Results Terminal Card
             resultsBox = new RichTextBox {
-                Bounds = new Rectangle(16, 594, 488, 220),
+                Bounds = new Rectangle(16, 614, 488, 240),
                 BackColor = Color.FromArgb(14, 14, 16),
                 ForeColor = Color.FromArgb(200, 200, 205),
                 Font = new Font("Segoe UI", 9.5f),
@@ -504,11 +658,11 @@ namespace ProxyDominator
                         }
                     }
                 }
-            } catch {}
+            } catch { }
 
             if (proxies.Count == 0)
             {
-                proxies.Add(new ProxyItem("Default", "127.0.0.1:8080"));
+                proxies.Add(new ProxyItem("Пример", "127.0.0.1:8080"));
             }
             UpdateCombo();
         }
@@ -533,7 +687,7 @@ namespace ProxyDominator
                         if (ov != null) { bypassTxt.Text = ov.ToString(); return; }
                     }
                 }
-            } catch {}
+            } catch { }
             bypassTxt.Text = "localhost;127.0.0.1;*.ru;<local>";
         }
 
@@ -588,7 +742,7 @@ namespace ProxyDominator
                         toggleBtn.Text = "ENABLE PROXY";
                     }
                 }
-            } catch {}
+            } catch { }
         }
 
         private void ToggleProxy(object s, EventArgs e)
@@ -600,13 +754,25 @@ namespace ProxyDominator
                     int state = (int)key.GetValue("ProxyEnable", 0);
                     if (state == 1) {
                         key.SetValue("ProxyEnable", 0);
+                        authBridge.Stop();
                     } else {
                         if (proxyCombo.SelectedIndex == -1 || proxyCombo.SelectedItem == null) {
                             MessageBox.Show("Не выбран прокси-сервер!", "Proxy Dominator", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                             return;
                         }
                         ProxyItem selected = (ProxyItem)proxyCombo.SelectedItem;
-                        key.SetValue("ProxyServer", selected.Endpoint);
+
+                        if (selected.HasAuth)
+                        {
+                            authBridge.Start(selected.Endpoint, selected.Username, selected.Password);
+                            key.SetValue("ProxyServer", "127.0.0.1:" + authBridge.LocalPort);
+                        }
+                        else
+                        {
+                            authBridge.Stop();
+                            key.SetValue("ProxyServer", selected.Endpoint);
+                        }
+
                         key.SetValue("ProxyEnable", 1);
                     }
                 }
@@ -633,7 +799,7 @@ namespace ProxyDominator
                         }
                     }
                 }
-            } catch {}
+            } catch { }
             return null;
         }
 
@@ -703,7 +869,12 @@ namespace ProxyDominator
                         try {
                             var req = (HttpWebRequest)WebRequest.Create("https://www.google.com/generate_204");
                             req.Timeout = 3500;
-                            req.Proxy = new WebProxy("http://" + p.Endpoint);
+                            var webProxy = new WebProxy("http://" + p.Endpoint);
+                            if (p.HasAuth)
+                            {
+                                webProxy.Credentials = new NetworkCredential(p.Username, p.Password);
+                            }
+                            req.Proxy = webProxy;
                             using (var res = req.GetResponse()) { }
                             sw.Stop();
                             ms = sw.ElapsedMilliseconds;
@@ -723,7 +894,6 @@ namespace ProxyDominator
             }
 
             await Task.WhenAll(tasks);
-
             proxies.Sort((a, b) => a.PingMs.CompareTo(b.PingMs));
             SaveConfig();
             UpdateCombo();
@@ -769,6 +939,7 @@ namespace ProxyDominator
                 using (var key = Registry.CurrentUser.OpenSubKey(REG_PATH, true)) {
                     if (key != null) key.SetValue("ProxyEnable", 0);
                 }
+                authBridge.Stop();
                 InternetSetOption(IntPtr.Zero, 39, IntPtr.Zero, 0);
                 InternetSetOption(IntPtr.Zero, 37, IntPtr.Zero, 0);
 
