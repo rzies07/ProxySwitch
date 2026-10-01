@@ -17,7 +17,7 @@ echo [1] Compiling ProxySwitch.exe with app.ico...
 
 if %errorlevel% equ 0 (
     echo [2] Success! Starting app...
-    start ProxyDominator.exe
+    start ProxySwitch.exe
 ) else (
     echo [ERROR] Compilation failed.
     pause
