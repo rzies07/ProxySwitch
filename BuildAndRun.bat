@@ -13,7 +13,7 @@ if not exist "%CSC%" (
 )
 
 echo [1] Compiling ProxyDominator.exe with app.ico...
-"%CSC%" /nologo /target:winexe /win32icon:app.ico /out:ProxyDominator.exe ProxyDominator.cs
+"%CSC%" /nologo /target:winexe /win32icon:app.ico /out:ProxySwitch.exe ProxySwitch.cs
 
 if %errorlevel% equ 0 (
     echo [2] Success! Starting app...
