@@ -12,7 +12,7 @@ if not exist "%CSC%" (
     exit /b
 )
 
-echo [1] Compiling ProxyDominator.exe with app.ico...
+echo [1] Compiling ProxySwitch.exe with app.ico...
 "%CSC%" /nologo /target:winexe /win32icon:app.ico /out:ProxySwitch.exe ProxySwitch.cs
 
 if %errorlevel% equ 0 (
