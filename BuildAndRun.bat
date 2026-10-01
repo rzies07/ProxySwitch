@@ -1,7 +1,7 @@
 @echo off
 setlocal
 echo ----------------------------------------
-echo PROXY DOMINATOR - CLEAN SOLID BUILD
+echo PROXY Switch - CLEAN SOLID BUILD
 echo ----------------------------------------
 
 set "CSC=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
